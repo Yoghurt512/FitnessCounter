@@ -8,13 +8,18 @@ int main()
     PoseDetector detector;
 
     if (!detector.initialize(
-        "models/yolo11n-pose.onnx"))
+        "A/models/yolo11n-pose.onnx"))
     {
         return -1;
     }
 
-  // cv::VideoCapture cap("C:/Users/Y9000P/Desktop/pushvideo/test1.mp4");
-   cv::VideoCapture cap(0);
+    // 摄像头：
+    cv::VideoCapture cap(0);
+
+    // 如果要测试视频，可改为：
+     //cv::VideoCapture cap(
+     //    "C:/Users/Y9000P/Desktop/pushvideo/test1.mp4"
+     //);
 
     if (!cap.isOpened())
     {
@@ -35,9 +40,8 @@ int main()
             break;
 
         // =====================
-        // A模块
+        // A 模块
         // =====================
-
         BodyPose pose =
             detector.detect(frame);
 
@@ -45,7 +49,6 @@ int main()
             frame,
             pose
         );
-
         // =====================
 
         cv::imshow(
@@ -53,9 +56,39 @@ int main()
             frame
         );
 
-        if (cv::waitKey(1) == 27)
+        const int key =
+            cv::waitKey(1);
+
+        if (key == 27) // ESC
+        {
             break;
+        }
+
+        if (key == ' ') // Space
+        {
+            if (detector.confirmCurrentCandidate())
+            {
+                std::cout
+                    << "MAIN PERSON confirmed by SPACE."
+                    << std::endl;
+            }
+            else
+            {
+                std::cout
+                    << "No valid candidate to confirm."
+                    << std::endl;
+            }
+        }
+
+        if (key == 'r' ||
+            key == 'R')
+        {
+            detector.resetMainPerson();
+        }
     }
+
+    cap.release();
+    cv::destroyAllWindows();
 
     return 0;
 }

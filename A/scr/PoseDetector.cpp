@@ -3,11 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <stdexcept>
+#include <limits>
 
 namespace
 {
-    // COCO Pose 17 keypoints used by YOLO pose models:
+    // COCO Pose 17 keypoints:
     // 0 nose
     // 1 left_eye
     // 2 right_eye
@@ -56,13 +56,13 @@ bool PoseDetector::initialize(const std::string& onnxPath)
     try
     {
         net_ = cv::dnn::readNetFromONNX(onnxPath);
+
         if (net_.empty())
         {
             std::cerr << "ERROR: ONNX model is empty.\n";
             return false;
         }
 
-        // CPU is the safest default for a first working version.
         net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
         net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
 
@@ -71,8 +71,11 @@ bool PoseDetector::initialize(const std::string& onnxPath)
     }
     catch (const cv::Exception& e)
     {
-        std::cerr << "OpenCV failed to load ONNX model:\n"
-            << e.what() << "\n";
+        std::cerr
+            << "OpenCV failed to load ONNX model:\n"
+            << e.what()
+            << "\n";
+
         return false;
     }
 }
@@ -87,90 +90,38 @@ void PoseDetector::setKeypointConfidenceThreshold(float value)
     keypointConfidenceThreshold_ = value;
 }
 
-
-void PoseDetector::resetTracking()
+bool PoseDetector::confirmCurrentCandidate()
 {
+    if (mainPersonConfirmed_)
+        return true;
+
+    if (!hasSelectionCandidate_)
+        return false;
+
+    if (countUsefulKeypoints(selectionCandidate_) < 6)
+        return false;
+
+    lockCurrentSelection();
+    return true;
+}
+
+void PoseDetector::resetMainPerson()
+{
+    mainPersonConfirmed_ = false;
     hasTrackedPerson_ = false;
-    previousPersonBox_ = cv::Rect();
     lostFrames_ = 0;
+
+    hasSelectionCandidate_ = false;
+    selectionCandidate_ = Candidate{};
+    previousTrackedCandidate_ = Candidate{};
+    selectionStartTime_ = std::chrono::steady_clock::time_point{};
+
+    std::cout << "MAIN PERSON reset. Start selecting again.\n";
 }
 
-float PoseDetector::calculateIoU(
-    const cv::Rect& a,
-    const cv::Rect& b)
+bool PoseDetector::isMainPersonConfirmed() const
 {
-    const cv::Rect intersection = a & b;
-
-    const float intersectionArea =
-        static_cast<float>(intersection.area());
-
-    if (intersectionArea <= 0.0f)
-        return 0.0f;
-
-    const float unionArea =
-        static_cast<float>(
-            a.area() +
-            b.area() -
-            intersection.area()
-            );
-
-    if (unionArea <= 0.0f)
-        return 0.0f;
-
-    return intersectionArea / unionArea;
-}
-
-float PoseDetector::calculateCenterSimilarity(
-    const cv::Rect& a,
-    const cv::Rect& b,
-    const cv::Size& frameSize)
-{
-    const cv::Point2f centerA(
-        a.x + a.width * 0.5f,
-        a.y + a.height * 0.5f
-    );
-
-    const cv::Point2f centerB(
-        b.x + b.width * 0.5f,
-        b.y + b.height * 0.5f
-    );
-
-    const float dx = centerA.x - centerB.x;
-    const float dy = centerA.y - centerB.y;
-
-    const float distance =
-        std::sqrt(dx * dx + dy * dy);
-
-    const float fw = static_cast<float>(frameSize.width);
-    const float fh = static_cast<float>(frameSize.height);
-
-    const float diagonal =
-        std::sqrt(fw * fw + fh * fh);
-
-    if (diagonal <= 0.0f)
-        return 0.0f;
-
-    const float normalizedDistance =
-        std::min(distance / diagonal, 1.0f);
-
-    return 1.0f - normalizedDistance;
-}
-
-float PoseDetector::calculateSizeSimilarity(
-    const cv::Rect& a,
-    const cv::Rect& b)
-{
-    const float areaA =
-        static_cast<float>(a.area());
-
-    const float areaB =
-        static_cast<float>(b.area());
-
-    if (areaA <= 0.0f || areaB <= 0.0f)
-        return 0.0f;
-
-    return std::min(areaA, areaB) /
-        std::max(areaA, areaB);
+    return mainPersonConfirmed_;
 }
 
 cv::Mat PoseDetector::letterbox(
@@ -179,15 +130,32 @@ cv::Mat PoseDetector::letterbox(
     int& padX,
     int& padY) const
 {
-    const float sx = static_cast<float>(inputWidth_) / src.cols;
-    const float sy = static_cast<float>(inputHeight_) / src.rows;
+    const float sx =
+        static_cast<float>(inputWidth_) /
+        static_cast<float>(src.cols);
+
+    const float sy =
+        static_cast<float>(inputHeight_) /
+        static_cast<float>(src.rows);
+
     scale = std::min(sx, sy);
 
-    const int newW = static_cast<int>(std::round(src.cols * scale));
-    const int newH = static_cast<int>(std::round(src.rows * scale));
+    const int newW =
+        static_cast<int>(
+            std::round(src.cols * scale)
+            );
+
+    const int newH =
+        static_cast<int>(
+            std::round(src.rows * scale)
+            );
 
     cv::Mat resized;
-    cv::resize(src, resized, cv::Size(newW, newH));
+    cv::resize(
+        src,
+        resized,
+        cv::Size(newW, newH)
+    );
 
     const int dw = inputWidth_ - newW;
     const int dh = inputHeight_ - newH;
@@ -201,6 +169,7 @@ cv::Mat PoseDetector::letterbox(
     padY = top;
 
     cv::Mat padded;
+
     cv::copyMakeBorder(
         resized,
         padded,
@@ -209,7 +178,8 @@ cv::Mat PoseDetector::letterbox(
         left,
         right,
         cv::BORDER_CONSTANT,
-        cv::Scalar(114, 114, 114));
+        cv::Scalar(114, 114, 114)
+    );
 
     return padded;
 }
@@ -222,11 +192,29 @@ cv::Point2f PoseDetector::mapBack(
     int padY,
     const cv::Size& originalSize)
 {
-    float ox = (x - padX) / scale;
-    float oy = (y - padY) / scale;
+    float ox =
+        (x - static_cast<float>(padX)) /
+        scale;
 
-    ox = clampf(ox, 0.0f, static_cast<float>(originalSize.width - 1));
-    oy = clampf(oy, 0.0f, static_cast<float>(originalSize.height - 1));
+    float oy =
+        (y - static_cast<float>(padY)) /
+        scale;
+
+    ox = clampf(
+        ox,
+        0.0f,
+        static_cast<float>(
+            originalSize.width - 1
+            )
+    );
+
+    oy = clampf(
+        oy,
+        0.0f,
+        static_cast<float>(
+            originalSize.height - 1
+            )
+    );
 
     return cv::Point2f(ox, oy);
 }
@@ -245,15 +233,15 @@ std::vector<PoseDetector::Candidate> PoseDetector::decode(
 
     cv::Mat output = rawOutput;
 
-    // Typical exported Ultralytics pose output is:
-    // [1, 56, 8400]  -> 4 box + 1 person score + 17*3 keypoint values
-    //
-    // Some exports can appear as [1, 8400, 56].
-    // Normalize both layouts to an Nx56 matrix.
-
+    // Ultralytics COCO pose output:
+    // [1, 56, 8400] or [1, 8400, 56].
     if (output.dims != 3)
     {
-        std::cerr << "Unexpected model output dims: " << output.dims << "\n";
+        std::cerr
+            << "Unexpected model output dims: "
+            << output.dims
+            << "\n";
+
         return candidates;
     }
 
@@ -264,20 +252,40 @@ std::vector<PoseDetector::Candidate> PoseDetector::decode(
 
     if (d1 == 56)
     {
-        cv::Mat temp(56, d2, CV_32F, output.ptr<float>());
-        cv::transpose(temp, predictions); // d2 x 56
+        cv::Mat temp(
+            56,
+            d2,
+            CV_32F,
+            output.ptr<float>()
+        );
+
+        cv::transpose(
+            temp,
+            predictions
+        );
     }
     else if (d2 == 56)
     {
-        predictions = cv::Mat(d1, 56, CV_32F, output.ptr<float>()).clone();
+        predictions =
+            cv::Mat(
+                d1,
+                56,
+                CV_32F,
+                output.ptr<float>()
+            ).clone();
     }
     else
     {
-        std::cerr << "Unexpected pose output shape: ["
+        std::cerr
+            << "Unexpected pose output shape: ["
             << output.size[0] << ", "
             << d1 << ", "
             << d2 << "]\n";
-        std::cerr << "This code expects an Ultralytics COCO pose model with 56 values per prediction.\n";
+
+        std::cerr
+            << "This code expects an Ultralytics "
+            << "COCO pose model with 56 values per prediction.\n";
+
         return candidates;
     }
 
@@ -285,9 +293,12 @@ std::vector<PoseDetector::Candidate> PoseDetector::decode(
     std::vector<float> scores;
     std::vector<std::vector<KeyPoint>> allKeypoints;
 
-    for (int i = 0; i < predictions.rows; ++i)
+    for (int i = 0;
+        i < predictions.rows;
+        ++i)
     {
-        const float* p = predictions.ptr<float>(i);
+        const float* p =
+            predictions.ptr<float>(i);
 
         const float cx = p[0];
         const float cy = p[1];
@@ -295,348 +306,1030 @@ std::vector<PoseDetector::Candidate> PoseDetector::decode(
         const float h = p[3];
         const float personScore = p[4];
 
-        if (personScore < personConfidenceThreshold_)
+        if (personScore <
+            personConfidenceThreshold_)
+        {
             continue;
+        }
 
-        const float x1 = cx - w * 0.5f;
-        const float y1 = cy - h * 0.5f;
-        const float x2 = cx + w * 0.5f;
-        const float y2 = cy + h * 0.5f;
+        const float x1 =
+            cx - w * 0.5f;
 
-        cv::Point2f tl = mapBack(x1, y1, scale, padX, padY, originalSize);
-        cv::Point2f br = mapBack(x2, y2, scale, padX, padY, originalSize);
+        const float y1 =
+            cy - h * 0.5f;
 
-        int bx = static_cast<int>(tl.x);
-        int by = static_cast<int>(tl.y);
-        int bw = std::max(1, static_cast<int>(br.x - tl.x));
-        int bh = std::max(1, static_cast<int>(br.y - tl.y));
+        const float x2 =
+            cx + w * 0.5f;
 
-        cv::Rect box(bx, by, bw, bh);
-        box &= cv::Rect(0, 0, originalSize.width, originalSize.height);
+        const float y2 =
+            cy + h * 0.5f;
 
-        std::vector<KeyPoint> keypoints(17);
+        cv::Point2f tl =
+            mapBack(
+                x1,
+                y1,
+                scale,
+                padX,
+                padY,
+                originalSize
+            );
+
+        cv::Point2f br =
+            mapBack(
+                x2,
+                y2,
+                scale,
+                padX,
+                padY,
+                originalSize
+            );
+
+        int bx =
+            static_cast<int>(tl.x);
+
+        int by =
+            static_cast<int>(tl.y);
+
+        int bw =
+            std::max(
+                1,
+                static_cast<int>(
+                    br.x - tl.x
+                    )
+            );
+
+        int bh =
+            std::max(
+                1,
+                static_cast<int>(
+                    br.y - tl.y
+                    )
+            );
+
+        cv::Rect box(
+            bx,
+            by,
+            bw,
+            bh
+        );
+
+        box &=
+            cv::Rect(
+                0,
+                0,
+                originalSize.width,
+                originalSize.height
+            );
+
+        std::vector<KeyPoint>
+            keypoints(17);
 
         for (int k = 0; k < 17; ++k)
         {
-            const int base = 5 + k * 3;
+            const int base =
+                5 + k * 3;
 
-            const float kx = p[base + 0];
-            const float ky = p[base + 1];
-            const float kc = p[base + 2];
+            const float kx =
+                p[base + 0];
+
+            const float ky =
+                p[base + 1];
+
+            const float kc =
+                p[base + 2];
 
             KeyPoint kp;
-            kp.position = mapBack(kx, ky, scale, padX, padY, originalSize);
+
+            kp.position =
+                mapBack(
+                    kx,
+                    ky,
+                    scale,
+                    padX,
+                    padY,
+                    originalSize
+                );
+
             kp.confidence = kc;
-            kp.valid = kc >= keypointConfidenceThreshold_;
+
+            kp.valid =
+                kc >=
+                keypointConfidenceThreshold_;
 
             keypoints[k] = kp;
         }
 
         boxes.push_back(box);
         scores.push_back(personScore);
-        allKeypoints.push_back(std::move(keypoints));
+        allKeypoints.push_back(
+            std::move(keypoints)
+        );
     }
 
     std::vector<int> keep;
+
     cv::dnn::NMSBoxes(
         boxes,
         scores,
         personConfidenceThreshold_,
         nmsThreshold_,
-        keep);
+        keep
+    );
 
     for (int idx : keep)
     {
         Candidate c;
+
         c.box = boxes[idx];
         c.score = scores[idx];
-        c.keypoints = allKeypoints[idx];
-        candidates.push_back(std::move(c));
+        c.keypoints =
+            allKeypoints[idx];
+
+        candidates.push_back(
+            std::move(c)
+        );
     }
 
     return candidates;
+}
+
+int PoseDetector::countUsefulKeypoints(
+    const Candidate& candidate) const
+{
+    int count = 0;
+
+    for (const auto& item :
+        kWantedJoints)
+    {
+        const int index =
+            item.second;
+
+        if (index < 0 ||
+            index >=
+            static_cast<int>(
+                candidate.keypoints.size()
+                ))
+        {
+            continue;
+        }
+
+        if (candidate.keypoints[index].confidence >=
+            keypointConfidenceThreshold_)
+        {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+int PoseDetector::chooseInitialCandidate(
+    const std::vector<Candidate>& candidates,
+    const cv::Size& frameSize) const
+{
+    if (candidates.empty())
+        return -1;
+
+    const cv::Point2f frameCenter(
+        frameSize.width * 0.5f,
+        frameSize.height * 0.5f
+    );
+
+    const float frameDiagonal =
+        std::sqrt(
+            static_cast<float>(
+                frameSize.width *
+                frameSize.width +
+                frameSize.height *
+                frameSize.height
+                )
+        );
+
+    const float frameArea =
+        static_cast<float>(
+            std::max(
+                1,
+                frameSize.width *
+                frameSize.height
+            )
+            );
+
+    int bestIndex = -1;
+
+    float bestScore =
+        -std::numeric_limits<float>::infinity();
+
+    for (int i = 0;
+        i < static_cast<int>(
+            candidates.size()
+            );
+        ++i)
+    {
+        const Candidate& c =
+            candidates[i];
+
+        // 选择阶段只考虑关键点足够完整的人。
+        if (countUsefulKeypoints(c) < 6)
+            continue;
+
+        const cv::Point2f center(
+            c.box.x +
+            c.box.width * 0.5f,
+
+            c.box.y +
+            c.box.height * 0.5f
+        );
+
+        const float dx =
+            center.x - frameCenter.x;
+
+        const float dy =
+            center.y - frameCenter.y;
+
+        const float centerDistance =
+            std::sqrt(
+                dx * dx +
+                dy * dy
+            );
+
+        const float centerRatio =
+            frameDiagonal > 1.0f
+            ? centerDistance /
+            frameDiagonal
+            : 1.0f;
+
+        const float centerScore =
+            clampf(
+                1.0f -
+                centerRatio * 2.2f,
+                0.0f,
+                1.0f
+            );
+
+        const float areaRatio =
+            static_cast<float>(
+                c.box.area()
+                ) /
+            frameArea;
+
+        const float sizeScore =
+            clampf(
+                std::sqrt(
+                    std::max(
+                        0.0f,
+                        areaRatio
+                    )
+                ) * 2.0f,
+                0.0f,
+                1.0f
+            );
+
+        // 优先画面中央，同时略偏向更完整、更靠前的人。
+        const float score =
+            0.70f * centerScore +
+            0.20f * sizeScore +
+            0.10f * c.score;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestIndex = i;
+        }
+    }
+
+    return bestIndex;
+}
+
+float PoseDetector::calculateIoU(
+    const cv::Rect& a,
+    const cv::Rect& b)
+{
+    const cv::Rect intersection =
+        a & b;
+
+    const float intersectionArea =
+        static_cast<float>(
+            intersection.area()
+            );
+
+    if (intersectionArea <= 0.0f)
+        return 0.0f;
+
+    const float unionArea =
+        static_cast<float>(
+            a.area() +
+            b.area() -
+            intersection.area()
+            );
+
+    if (unionArea <= 0.0f)
+        return 0.0f;
+
+    return intersectionArea /
+        unionArea;
+}
+
+float PoseDetector::calculateCenterDistanceRatio(
+    const cv::Rect& reference,
+    const cv::Rect& current)
+{
+    const cv::Point2f a(
+        reference.x +
+        reference.width * 0.5f,
+
+        reference.y +
+        reference.height * 0.5f
+    );
+
+    const cv::Point2f b(
+        current.x +
+        current.width * 0.5f,
+
+        current.y +
+        current.height * 0.5f
+    );
+
+    const float dx =
+        b.x - a.x;
+
+    const float dy =
+        b.y - a.y;
+
+    const float distance =
+        std::sqrt(
+            dx * dx +
+            dy * dy
+        );
+
+    const float diagonal =
+        std::sqrt(
+            static_cast<float>(
+                reference.width *
+                reference.width +
+                reference.height *
+                reference.height
+                )
+        );
+
+    if (diagonal <= 1.0f)
+        return 999.0f;
+
+    return distance /
+        diagonal;
+}
+
+float PoseDetector::calculateSizeSimilarity(
+    const cv::Rect& a,
+    const cv::Rect& b)
+{
+    const float areaA =
+        static_cast<float>(
+            std::max(1, a.area())
+            );
+
+    const float areaB =
+        static_cast<float>(
+            std::max(1, b.area())
+            );
+
+    return std::min(
+        areaA,
+        areaB
+    ) /
+        std::max(
+            areaA,
+            areaB
+        );
+}
+
+float PoseDetector::keypointSimilarity(
+    const Candidate& reference,
+    const Candidate& current) const
+{
+    const int count =
+        std::min(
+            static_cast<int>(
+                reference.keypoints.size()
+                ),
+            static_cast<int>(
+                current.keypoints.size()
+                )
+        );
+
+    if (count <= 0)
+        return 0.0f;
+
+    const float referenceDiagonal =
+        std::sqrt(
+            static_cast<float>(
+                reference.box.width *
+                reference.box.width +
+                reference.box.height *
+                reference.box.height
+                )
+        );
+
+    if (referenceDiagonal <= 1.0f)
+        return 0.0f;
+
+    float similaritySum = 0.0f;
+    int used = 0;
+
+    for (const auto& item :
+        kWantedJoints)
+    {
+        const int index =
+            item.second;
+
+        if (index < 0 ||
+            index >= count)
+        {
+            continue;
+        }
+
+        const KeyPoint& a =
+            reference.keypoints[index];
+
+        const KeyPoint& b =
+            current.keypoints[index];
+
+        if (a.confidence <
+            keypointConfidenceThreshold_ ||
+            b.confidence <
+            keypointConfidenceThreshold_)
+        {
+            continue;
+        }
+
+        const float dx =
+            b.position.x -
+            a.position.x;
+
+        const float dy =
+            b.position.y -
+            a.position.y;
+
+        const float distanceRatio =
+            std::sqrt(
+                dx * dx +
+                dy * dy
+            ) /
+            referenceDiagonal;
+
+        const float similarity =
+            clampf(
+                1.0f -
+                distanceRatio / 0.55f,
+                0.0f,
+                1.0f
+            );
+
+        similaritySum +=
+            similarity;
+
+        ++used;
+    }
+
+    if (used < 3)
+        return 0.0f;
+
+    return similaritySum /
+        static_cast<float>(used);
+}
+
+bool PoseDetector::passesHardGate(
+    const Candidate& reference,
+    const Candidate& current,
+    bool hardLock) const
+{
+    if (reference.box.area() <= 0 ||
+        current.box.area() <= 0)
+    {
+        return false;
+    }
+
+    const float referenceArea =
+        static_cast<float>(
+            reference.box.area()
+            );
+
+    const float currentArea =
+        static_cast<float>(
+            current.box.area()
+            );
+
+    const float areaRatio =
+        currentArea /
+        referenceArea;
+
+    // MAIN PERSON 已确认后使用更严格的尺寸连续性。
+    const float minAreaRatio =
+        hardLock ? 0.50f : 0.42f;
+
+    const float maxAreaRatio =
+        hardLock ? 1.80f : 2.20f;
+
+    if (areaRatio < minAreaRatio ||
+        areaRatio > maxAreaRatio)
+    {
+        return false;
+    }
+
+    const float centerRatio =
+        calculateCenterDistanceRatio(
+            reference.box,
+            current.box
+        );
+
+    const float maxCenterRatio =
+        hardLock ? 1.05f : 1.35f;
+
+    if (centerRatio >
+        maxCenterRatio)
+    {
+        return false;
+    }
+
+    const float iou =
+        calculateIoU(
+            reference.box,
+            current.box
+        );
+
+    // 完全没有框重叠时，中心也必须足够接近。
+    if (iou <= 0.001f &&
+        centerRatio >
+        (hardLock ? 0.62f : 0.82f))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+float PoseDetector::candidateMatchScore(
+    const Candidate& reference,
+    const Candidate& current) const
+{
+    const float iou =
+        calculateIoU(
+            reference.box,
+            current.box
+        );
+
+    const float centerRatio =
+        calculateCenterDistanceRatio(
+            reference.box,
+            current.box
+        );
+
+    const float centerSimilarity =
+        clampf(
+            1.0f -
+            centerRatio / 1.15f,
+            0.0f,
+            1.0f
+        );
+
+    const float sizeSimilarity =
+        calculateSizeSimilarity(
+            reference.box,
+            current.box
+        );
+
+    const float poseSimilarity =
+        keypointSimilarity(
+            reference,
+            current
+        );
+
+    return
+        0.42f * iou +
+        0.28f * centerSimilarity +
+        0.15f * sizeSimilarity +
+        0.10f * poseSimilarity +
+        0.05f * current.score;
+}
+
+int PoseDetector::findBestMatch(
+    const Candidate& reference,
+    const std::vector<Candidate>& candidates,
+    bool hardLock) const
+{
+    int bestIndex = -1;
+
+    float bestScore =
+        -std::numeric_limits<float>::infinity();
+
+    for (int i = 0;
+        i < static_cast<int>(
+            candidates.size()
+            );
+        ++i)
+    {
+        const Candidate& current =
+            candidates[i];
+
+        if (countUsefulKeypoints(current) < 6)
+            continue;
+
+        if (!passesHardGate(
+            reference,
+            current,
+            hardLock))
+        {
+            continue;
+        }
+
+        const float score =
+            candidateMatchScore(
+                reference,
+                current
+            );
+
+        const float minScore =
+            hardLock
+            ? trackingMatchThreshold_
+            : 0.25f;
+
+        if (score < minScore)
+            continue;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestIndex = i;
+        }
+    }
+
+    return bestIndex;
+}
+
+BodyPose PoseDetector::makeBodyPose(
+    const Candidate& candidate,
+    bool usableByNextModule) const
+{
+    BodyPose result;
+
+    result.personBox =
+        candidate.box;
+
+    int validCount = 0;
+
+    for (const auto& item :
+        kWantedJoints)
+    {
+        const Joint joint =
+            item.first;
+
+        const int cocoIndex =
+            item.second;
+
+        if (cocoIndex < 0 ||
+            cocoIndex >=
+            static_cast<int>(
+                candidate.keypoints.size()
+                ))
+        {
+            continue;
+        }
+
+        KeyPoint kp =
+            candidate.keypoints[cocoIndex];
+
+        kp.valid =
+            kp.confidence >=
+            keypointConfidenceThreshold_;
+
+        result.joints[joint] =
+            kp;
+
+        if (kp.valid)
+            ++validCount;
+    }
+
+    // 选择阶段不把候选人交给 B 模块。
+    result.valid =
+        usableByNextModule &&
+        validCount >= 6;
+
+    return result;
+}
+
+void PoseDetector::startSelection(
+    const Candidate& candidate)
+{
+    selectionCandidate_ =
+        candidate;
+
+    hasSelectionCandidate_ =
+        true;
+
+    selectionStartTime_ =
+        std::chrono::steady_clock::now();
+}
+
+void PoseDetector::lockCurrentSelection()
+{
+    if (!hasSelectionCandidate_)
+        return;
+
+    mainPersonConfirmed_ =
+        true;
+
+    hasTrackedPerson_ =
+        true;
+
+    previousTrackedCandidate_ =
+        selectionCandidate_;
+
+    lostFrames_ = 0;
+
+    std::cout
+        << "MAIN PERSON confirmed.\n";
 }
 
 BodyPose PoseDetector::selectAndFilter(
     const std::vector<Candidate>& candidates,
     const cv::Size& frameSize)
 {
-    BodyPose result;
+    BodyPose emptyPose;
 
-    // ==========================================================
-    // 1. 当前没有检测到任何人
-    // ==========================================================
-    if (candidates.empty())
+    // =========================================================
+    // A. MAIN PERSON 尚未确认：3 秒稳定选择 / Space 手动确认
+    // =========================================================
+    if (!mainPersonConfirmed_)
     {
-        if (hasTrackedPerson_)
+        if (candidates.empty())
         {
-            ++lostFrames_;
+            hasSelectionCandidate_ =
+                false;
 
-            // 可能只是短暂遮挡/漏检，先不要立即切换到别人。
-            if (lostFrames_ <= maxLostFrames_)
-                return result;
+            selectionCandidate_ =
+                Candidate{};
 
-            // 丢失时间过长，解除旧目标锁定。
-            resetTracking();
+            selectionStartTime_ =
+                std::chrono::steady_clock::time_point{};
+
+            return emptyPose;
         }
 
-        return result;
-    }
+        int selectedIndex = -1;
 
-
-    // ==========================================================
-    // 2. 选择当前帧主运动者候选
-    // ==========================================================
-    int selectedIndex = -1;
-
-    // 第一次检测：选择画面中最大的人。
-    if (!hasTrackedPerson_)
-    {
-        int largestArea = -1;
-
-        for (int i = 0;
-            i < static_cast<int>(candidates.size());
-            ++i)
+        if (!hasSelectionCandidate_)
         {
-            const int area = candidates[i].box.area();
-
-            if (area > largestArea)
-            {
-                largestArea = area;
-                selectedIndex = i;
-            }
-        }
-    }
-    else
-    {
-        // 后续帧：优先寻找“最像上一帧主运动者”的人。
-        float bestTrackingScore = -1.0f;
-
-        for (int i = 0;
-            i < static_cast<int>(candidates.size());
-            ++i)
-        {
-            const Candidate& candidate = candidates[i];
-
-            const float iou =
-                calculateIoU(
-                    previousPersonBox_,
-                    candidate.box
-                );
-
-            const float centerSimilarity =
-                calculateCenterSimilarity(
-                    previousPersonBox_,
-                    candidate.box,
+            selectedIndex =
+                chooseInitialCandidate(
+                    candidates,
                     frameSize
                 );
 
-            const float sizeSimilarity =
-                calculateSizeSimilarity(
-                    previousPersonBox_,
-                    candidate.box
+            if (selectedIndex < 0)
+                return emptyPose;
+
+            startSelection(
+                candidates[selectedIndex]
+            );
+        }
+        else
+        {
+            selectedIndex =
+                findBestMatch(
+                    selectionCandidate_,
+                    candidates,
+                    false
                 );
 
-            const float trackingScore =
-                0.55f * iou +
-                0.25f * centerSimilarity +
-                0.15f * sizeSimilarity +
-                0.05f * candidate.score;
-
-            if (trackingScore > bestTrackingScore)
+            // 原候选不再连续：重新选择，并重新从 3 秒开始计时。
+            if (selectedIndex < 0)
             {
-                bestTrackingScore = trackingScore;
-                selectedIndex = i;
-            }
-        }
+                selectedIndex =
+                    chooseInitialCandidate(
+                        candidates,
+                        frameSize
+                    );
 
-        // 最相似的人仍然不够像：先视为主运动者暂时丢失。
-        if (bestTrackingScore < trackingMatchThreshold_)
-        {
-            ++lostFrames_;
-
-            if (lostFrames_ <= maxLostFrames_)
-                return result;
-
-            // 连续丢失太久，重新选择当前帧中最大的人。
-            resetTracking();
-
-            int largestArea = -1;
-            selectedIndex = -1;
-
-            for (int i = 0;
-                i < static_cast<int>(candidates.size());
-                ++i)
-            {
-                const int area = candidates[i].box.area();
-
-                if (area > largestArea)
+                if (selectedIndex < 0)
                 {
-                    largestArea = area;
-                    selectedIndex = i;
+                    hasSelectionCandidate_ =
+                        false;
+
+                    return emptyPose;
                 }
+
+                startSelection(
+                    candidates[selectedIndex]
+                );
+            }
+            else
+            {
+                selectionCandidate_ =
+                    candidates[selectedIndex];
             }
         }
+
+        if (!hasSelectionCandidate_)
+            return emptyPose;
+
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        const double elapsed =
+            std::chrono::duration<double>(
+                now - selectionStartTime_
+            ).count();
+
+        if (elapsed >=
+            autoConfirmSeconds_)
+        {
+            lockCurrentSelection();
+
+            return makeBodyPose(
+                previousTrackedCandidate_,
+                true
+            );
+        }
+
+        // 选择阶段返回候选人的关节用于画面显示，
+        // 但 valid=false，后面的 B 模块不会提前使用。
+        return makeBodyPose(
+            selectionCandidate_,
+            false
+        );
     }
 
-
-    // ==========================================================
-    // 3. 没有找到有效候选
-    // ==========================================================
-    if (selectedIndex < 0 ||
-        selectedIndex >= static_cast<int>(candidates.size()))
+    // =========================================================
+    // B. MAIN PERSON 已确认：只跟踪已确认的人，不再选最大路人
+    // =========================================================
+    if (candidates.empty())
     {
-        return result;
+        ++lostFrames_;
+        return emptyPose;
     }
 
+    if (!hasTrackedPerson_)
+    {
+        // 正常情况下不会进入这里。
+        // 为避免自动换人，不做任何重新选最大框。
+        ++lostFrames_;
+        return emptyPose;
+    }
 
-    // ==========================================================
-    // 4. 更新主运动者跟踪状态
-    // ==========================================================
-    const Candidate& selected =
+    const int selectedIndex =
+        findBestMatch(
+            previousTrackedCandidate_,
+            candidates,
+            true
+        );
+
+    if (selectedIndex < 0)
+    {
+        ++lostFrames_;
+
+        // 关键规则：
+        // 找不到原 MAIN PERSON 时宁可本帧无姿态，
+        // 也绝不自动把旁边的人改成 MAIN PERSON。
+        return emptyPose;
+    }
+
+    previousTrackedCandidate_ =
         candidates[selectedIndex];
 
-    previousPersonBox_ = selected.box;
-    hasTrackedPerson_ = true;
     lostFrames_ = 0;
 
-    result.personBox = selected.box;
-
-
-    // ==========================================================
-    // 5. 保留当前项目需要的关键点
-    // ==========================================================
-    int validCount = 0;
-
-    for (const auto& item : kWantedJoints)
-    {
-        const Joint joint = item.first;
-        const int cocoIndex = item.second;
-
-        if (cocoIndex < 0 ||
-            cocoIndex >= static_cast<int>(selected.keypoints.size()))
-        {
-            continue;
-        }
-
-        KeyPoint kp = selected.keypoints[cocoIndex];
-
-        // 最终再按当前阈值统一过滤一次。
-        kp.valid =
-            kp.confidence >= keypointConfidenceThreshold_;
-
-        result.joints[joint] = kp;
-
-        if (kp.valid)
-            ++validCount;
-    }
-
-    result.valid = validCount >= 6;
-
-    return result;
+    return makeBodyPose(
+        previousTrackedCandidate_,
+        true
+    );
 }
 
-BodyPose PoseDetector::detect(const cv::Mat& frame)
+BodyPose PoseDetector::detect(
+    const cv::Mat& frame)
 {
     BodyPose emptyPose;
 
-    if (frame.empty() || net_.empty())
+    if (frame.empty() ||
+        net_.empty())
+    {
         return emptyPose;
+    }
 
     float scale = 1.0f;
     int padX = 0;
     int padY = 0;
 
-    cv::Mat input = letterbox(frame, scale, padX, padY);
+    cv::Mat input =
+        letterbox(
+            frame,
+            scale,
+            padX,
+            padY
+        );
 
-    cv::Mat blob = cv::dnn::blobFromImage(
-        input,
-        1.0 / 255.0,
-        cv::Size(inputWidth_, inputHeight_),
-        cv::Scalar(),
-        true,   // BGR -> RGB
-        false,  // no crop
-        CV_32F);
+    cv::Mat blob =
+        cv::dnn::blobFromImage(
+            input,
+            1.0 / 255.0,
+            cv::Size(
+                inputWidth_,
+                inputHeight_
+            ),
+            cv::Scalar(),
+            true,   // BGR -> RGB
+            false,  // no crop
+            CV_32F
+        );
 
     net_.setInput(blob);
 
     std::vector<cv::Mat> outputs;
-    std::vector<std::string> outputNames = net_.getUnconnectedOutLayersNames();
-    net_.forward(outputs, outputNames);
+
+    const std::vector<std::string>
+        outputNames =
+        net_.getUnconnectedOutLayersNames();
+
+    net_.forward(
+        outputs,
+        outputNames
+    );
 
     if (outputs.empty())
         return emptyPose;
 
-    std::vector<Candidate> candidates =
-        decode(outputs[0], frame.size(), scale, padX, padY);
+    const std::vector<Candidate>
+        candidates =
+        decode(
+            outputs[0],
+            frame.size(),
+            scale,
+            padX,
+            padY
+        );
 
-    return selectAndFilter(candidates, frame.size());
+    return selectAndFilter(
+        candidates,
+        frame.size()
+    );
 }
 
 void PoseDetector::drawPose(
     cv::Mat& frame,
     const BodyPose& pose) const
 {
-    // ==========================================================
-    // 1. 定义身体骨架
-    //
-    // 注意：
-    // Head 不直接连接 LeftShoulder / RightShoulder
-    //
-    // Head -> Neck -> Shoulders
-    // 在后面单独绘制
-    // ==========================================================
-
-    const std::vector<std::pair<Joint, Joint>> skeleton =
+    const std::vector<
+        std::pair<Joint, Joint>
+    > skeleton =
     {
-        // 左手臂
-        { Joint::LeftShoulder, Joint::LeftElbow },
-        { Joint::LeftElbow, Joint::LeftWrist },
+        {Joint::LeftShoulder,  Joint::LeftElbow},
+        {Joint::LeftElbow,     Joint::LeftWrist},
 
-        // 右手臂
-        { Joint::RightShoulder, Joint::RightElbow },
-        { Joint::RightElbow, Joint::RightWrist },
+        {Joint::RightShoulder, Joint::RightElbow},
+        {Joint::RightElbow,    Joint::RightWrist},
 
-        // 左侧躯干
-        { Joint::LeftShoulder, Joint::LeftHip },
+        {Joint::LeftShoulder,  Joint::LeftHip},
+        {Joint::RightShoulder, Joint::RightHip},
 
-        // 右侧躯干
-        { Joint::RightShoulder, Joint::RightHip },
+        {Joint::LeftHip,       Joint::RightHip},
 
-        // 髋部连接
-        { Joint::LeftHip, Joint::RightHip },
+        {Joint::LeftHip,       Joint::LeftKnee},
+        {Joint::LeftKnee,      Joint::LeftAnkle},
 
-        // 左腿
-        { Joint::LeftHip, Joint::LeftKnee },
-        { Joint::LeftKnee, Joint::LeftAnkle },
-
-        // 右腿
-        { Joint::RightHip, Joint::RightKnee },
-        { Joint::RightKnee, Joint::RightAnkle }
+        {Joint::RightHip,      Joint::RightKnee},
+        {Joint::RightKnee,     Joint::RightAnkle}
     };
 
-
-    // ==========================================================
-    // 2. 绘制普通骨架
-    // ==========================================================
-
-    for (const auto& bone : skeleton)
+    // -------------------------
+    // 普通骨架
+    // -------------------------
+    for (const auto& bone :
+        skeleton)
     {
-        auto it1 = pose.joints.find(bone.first);
-        auto it2 = pose.joints.find(bone.second);
+        const auto it1 =
+            pose.joints.find(
+                bone.first
+            );
 
-        // 关节不存在
-        if (it1 == pose.joints.end() ||
-            it2 == pose.joints.end())
+        const auto it2 =
+            pose.joints.find(
+                bone.second
+            );
+
+        if (it1 ==
+            pose.joints.end() ||
+            it2 ==
+            pose.joints.end())
         {
             continue;
         }
 
-        const KeyPoint& kp1 = it1->second;
-        const KeyPoint& kp2 = it2->second;
+        const KeyPoint& kp1 =
+            it1->second;
 
-        // 两个点必须同时有效
-        if (!kp1.valid || !kp2.valid)
+        const KeyPoint& kp2 =
+            it2->second;
+
+        if (!kp1.valid ||
+            !kp2.valid)
         {
             continue;
         }
@@ -651,24 +1344,23 @@ void PoseDetector::drawPose(
         );
     }
 
+    // -------------------------
+    // Head -> Neck -> Shoulders
+    // -------------------------
+    const auto leftShoulderIt =
+        pose.joints.find(
+            Joint::LeftShoulder
+        );
 
-    // ==========================================================
-    // 3. 计算 Neck
-    //
-    // Neck 不属于模型关键点
-    //
-    // Neck = 左肩和右肩的中点
-    // ==========================================================
+    const auto rightShoulderIt =
+        pose.joints.find(
+            Joint::RightShoulder
+        );
 
-    auto leftShoulderIt =
-        pose.joints.find(Joint::LeftShoulder);
-
-    auto rightShoulderIt =
-        pose.joints.find(Joint::RightShoulder);
-
-
-    if (leftShoulderIt != pose.joints.end() &&
-        rightShoulderIt != pose.joints.end())
+    if (leftShoulderIt !=
+        pose.joints.end() &&
+        rightShoulderIt !=
+        pose.joints.end())
     {
         const KeyPoint& leftShoulder =
             leftShoulderIt->second;
@@ -676,23 +1368,13 @@ void PoseDetector::drawPose(
         const KeyPoint& rightShoulder =
             rightShoulderIt->second;
 
-
-        // 左右肩都有效才能计算 Neck
         if (leftShoulder.valid &&
             rightShoulder.valid)
         {
-            // ==========================================
-            // Neck = 左右肩中点
-            // ==========================================
-
-            cv::Point2f neck =
+            const cv::Point2f neck =
                 (leftShoulder.position +
-                    rightShoulder.position) * 0.5f;
-
-
-            // ==========================================
-            // Neck -> LeftShoulder
-            // ==========================================
+                    rightShoulder.position)
+                * 0.5f;
 
             cv::line(
                 frame,
@@ -703,11 +1385,6 @@ void PoseDetector::drawPose(
                 cv::LINE_AA
             );
 
-
-            // ==========================================
-            // Neck -> RightShoulder
-            // ==========================================
-
             cv::line(
                 frame,
                 neck,
@@ -716,11 +1393,6 @@ void PoseDetector::drawPose(
                 2,
                 cv::LINE_AA
             );
-
-
-            // ==========================================
-            // 画 Neck 辅助点
-            // ==========================================
 
             cv::circle(
                 frame,
@@ -731,21 +1403,17 @@ void PoseDetector::drawPose(
                 cv::LINE_AA
             );
 
+            const auto headIt =
+                pose.joints.find(
+                    Joint::Head
+                );
 
-            // ==========================================
-            // 查找 Head
-            // ==========================================
-
-            auto headIt =
-                pose.joints.find(Joint::Head);
-
-            if (headIt != pose.joints.end())
+            if (headIt !=
+                pose.joints.end())
             {
                 const KeyPoint& head =
                     headIt->second;
 
-
-                // Head 有效才连接 Head -> Neck
                 if (head.valid)
                 {
                     cv::line(
@@ -761,27 +1429,20 @@ void PoseDetector::drawPose(
         }
     }
 
-
-    // ==========================================================
-    // 4. 绘制所有真正的关键点
-    // ==========================================================
-
-    for (const auto& item : pose.joints)
+    // -------------------------
+    // 关键点 + 名称 + confidence
+    // -------------------------
+    for (const auto& item :
+        pose.joints)
     {
-        Joint joint = item.first;
+        const Joint joint =
+            item.first;
 
         const KeyPoint& kp =
             item.second;
 
         if (!kp.valid)
-        {
             continue;
-        }
-
-
-        // ==========================================
-        // 绘制关键点
-        // ==========================================
 
         cv::circle(
             frame,
@@ -792,22 +1453,24 @@ void PoseDetector::drawPose(
             cv::LINE_AA
         );
 
-
-        // ==========================================
-        // 名称 + confidence
-        // ==========================================
-
-        std::string text =
-            std::string(JointName(joint)) +
+        const std::string text =
+            std::string(
+                JointName(joint)
+            ) +
             " " +
-            cv::format("%.2f", kp.confidence);
+            cv::format(
+                "%.2f",
+                kp.confidence
+            );
 
-
-        cv::Point textPosition(
-            static_cast<int>(kp.position.x + 6),
-            static_cast<int>(kp.position.y - 6)
+        const cv::Point textPosition(
+            static_cast<int>(
+                kp.position.x + 6
+                ),
+            static_cast<int>(
+                kp.position.y - 6
+                )
         );
-
 
         cv::putText(
             frame,
@@ -821,33 +1484,173 @@ void PoseDetector::drawPose(
         );
     }
 
-
-    // ==========================================================
-    // 5. 绘制人体检测框
-    // ==========================================================
-
-    if (pose.valid)
+    // =========================================================
+    // 状态显示
+    // =========================================================
+    if (!mainPersonConfirmed_)
     {
+        if (hasSelectionCandidate_ &&
+            pose.personBox.area() > 0)
+        {
+            const cv::Scalar orange(
+                0,
+                165,
+                255
+            );
+
+            cv::rectangle(
+                frame,
+                pose.personBox,
+                orange,
+                3,
+                cv::LINE_AA
+            );
+
+            const auto now =
+                std::chrono::steady_clock::now();
+
+            const double elapsed =
+                std::chrono::duration<double>(
+                    now -
+                    selectionStartTime_
+                ).count();
+
+            const double remaining =
+                std::max(
+                    0.0,
+                    autoConfirmSeconds_ -
+                    elapsed
+                );
+
+            const std::string label =
+                std::string(
+                    "SELECTING "
+                ) +
+                cv::format(
+                    "%.1fs",
+                    remaining
+                ) +
+                "  [SPACE confirm]";
+
+            const cv::Point labelPos(
+                pose.personBox.x,
+                std::max(
+                    25,
+                    pose.personBox.y - 10
+                )
+            );
+
+            cv::putText(
+                frame,
+                label,
+                labelPos,
+                cv::FONT_HERSHEY_SIMPLEX,
+                0.65,
+                orange,
+                2,
+                cv::LINE_AA
+            );
+        }
+        else
+        {
+            cv::putText(
+                frame,
+                "Stand near the center - waiting for candidate",
+                cv::Point(20, 35),
+                cv::FONT_HERSHEY_SIMPLEX,
+                0.65,
+                cv::Scalar(0, 165, 255),
+                2,
+                cv::LINE_AA
+            );
+        }
+
+        cv::putText(
+            frame,
+            "SPACE: confirm   R: reselect   ESC: exit",
+            cv::Point(
+                20,
+                std::max(
+                    30,
+                    frame.rows - 20
+                )
+            ),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            cv::Scalar(255, 255, 255),
+            1,
+            cv::LINE_AA
+        );
+
+        return;
+    }
+
+    // MAIN PERSON 已确认且当前帧匹配成功
+    if (pose.valid &&
+        pose.personBox.area() > 0)
+    {
+        const cv::Scalar green(
+            0,
+            255,
+            0
+        );
+
         cv::rectangle(
             frame,
             pose.personBox,
-            cv::Scalar(255, 0, 0),
-            2,
+            green,
+            3,
             cv::LINE_AA
+        );
+
+        const cv::Point labelPos(
+            pose.personBox.x,
+            std::max(
+                25,
+                pose.personBox.y - 10
+            )
         );
 
         cv::putText(
             frame,
             "MAIN PERSON",
-            cv::Point(
-                pose.personBox.x,
-                std::max(20, pose.personBox.y - 10)
-            ),
+            labelPos,
             cv::FONT_HERSHEY_SIMPLEX,
-            0.7,
-            cv::Scalar(0, 255, 0),
+            0.75,
+            green,
             2,
             cv::LINE_AA
         );
     }
+    else
+    {
+        // 锁仍然保留，只是当前帧没有找到原来的人。
+        cv::putText(
+            frame,
+            "MAIN PERSON LOST - waiting for the same person",
+            cv::Point(20, 35),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.65,
+            cv::Scalar(0, 0, 255),
+            2,
+            cv::LINE_AA
+        );
+    }
+
+    cv::putText(
+        frame,
+        "R: reselect MAIN PERSON   ESC: exit",
+        cv::Point(
+            20,
+            std::max(
+                30,
+                frame.rows - 20
+            )
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(255, 255, 255),
+        1,
+        cv::LINE_AA
+    );
 }
