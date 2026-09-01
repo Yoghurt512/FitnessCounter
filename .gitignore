@@ -6,6 +6,7 @@
 *.sln.docstates
 
 # Build folders
+build-*/
 Debug/
 Release/
 x64/
